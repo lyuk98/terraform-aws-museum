@@ -1,0 +1,112 @@
+name: Deploy Terraform configuration
+
+on:
+  push:
+    branches:
+      - main
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    name: Deploy Terraform configuration
+    permissions:
+      id-token: write
+    env:
+      VAULT_ADDR: ${{ secrets.VAULT_ADDR }}
+
+      TAILSCALE_OAUTH_CLIENT_ID: ${{ secrets.TF_TAILSCALE_OAUTH_CLIENT_ID }}
+      TAILSCALE_OAUTH_CLIENT_SECRET: ${{ secrets.TF_TAILSCALE_OAUTH_CLIENT_SECRET }}
+      CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+
+      TF_VAR_aws_region: ${{ secrets.AWS_REGION }}
+      TF_VAR_aws_availability_zone: ${{ secrets.AWS_AVAILABILITY_ZONE }}
+      TF_VAR_cloudflare_zone_id: ${{ secrets.CLOUDFLARE_ZONE_ID }}
+
+    steps:
+      - name: Set up Tailscale
+        uses: tailscale/github-action@v3
+        with:
+          oauth-client-id: ${{ secrets.TS_OAUTH_CLIENT_ID }}
+          oauth-secret: ${{ secrets.TS_OAUTH_SECRET }}
+          tags: tag:ci
+
+      - name: Configure AWS credentials
+        id: aws-credentials
+        uses: aws-actions/configure-aws-credentials@v4
+        with:
+          aws-region: us-east-1
+          role-to-assume: ${{ secrets.AWS_ROLE_TO_ASSUME }}
+          output-credentials: true
+          mask-aws-account-id: true
+
+      - name: Install Nix
+        uses: cachix/install-nix-action@v31
+
+      - name: Install Vault
+        run: |
+          wget -O - https://apt.releases.hashicorp.com/gpg | sudo gpg --dearmor -o /usr/share/keyrings/hashicorp-archive-keyring.gpg
+          echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/hashicorp-archive-keyring.gpg] https://apt.releases.hashicorp.com $(grep -oP '(?<=UBUNTU_CODENAME=).*' /etc/os-release || lsb_release -cs) main" | sudo tee /etc/apt/sources.list.d/hashicorp.list
+          sudo apt-get update && sudo apt-get install vault
+
+      - name: Log in to Vault
+        run: |
+          vault login \
+            -no-print \
+            -method=aws \
+            region=us-east-1 \
+            role=terraform-aws-museum \
+            aws_access_key_id=${{ steps.aws-credentials.outputs.aws-access-key-id }} \
+            aws_secret_access_key=${{ steps.aws-credentials.outputs.aws-secret-access-key }} \
+            aws_security_token=${{ steps.aws-credentials.outputs.aws-session-token }}
+
+      - name: Get secrets from Vault
+        id: vault-secrets
+        run: |
+          b2_state_application_key_id=$(vault kv get -field=application_key_id -mount=kv ente/b2/tfstate-aws-museum)
+          b2_state_application_key=$(vault kv get -field=application_key -mount=kv ente/b2/tfstate-aws-museum)
+          b2_state_bucket=$(vault kv get -field=b2_bucket -mount=kv ente/b2/tfstate-bootstrap)
+          b2_state_endpoint=$(vault kv get -field=b2_endpoint -mount=kv ente/b2/tfstate-bootstrap)
+
+          echo "::add-mask::$b2_state_application_key_id"
+          echo "::add-mask::$b2_state_application_key"
+          echo "::add-mask::$b2_state_bucket"
+          echo "::add-mask::$b2_state_endpoint"
+
+          echo "b2-state-application-key-id=$b2_state_application_key_id" >> $GITHUB_OUTPUT
+          echo "b2-state-application-key=$b2_state_application_key" >> $GITHUB_OUTPUT
+          echo "b2-state-bucket=$b2_state_bucket" >> $GITHUB_OUTPUT
+          echo "b2-state-endpoint=$b2_state_endpoint" >> $GITHUB_OUTPUT
+
+      - uses: actions/checkout@v4
+        with:
+          ref: main
+
+      - name: Set up Terraform
+        uses: hashicorp/setup-terraform@v3
+
+      - name: Terraform fmt
+        id: terraform-fmt
+        run: terraform fmt -check
+        continue-on-error: true
+
+      - name: Terraform init
+        id: terraform-init
+        run: |
+          terraform init \
+            -backend-config="bucket=${{ steps.vault-secrets.outputs.b2-state-bucket }}" \
+            -backend-config="endpoints={s3=\"${{ steps.vault-secrets.outputs.b2-state-endpoint }}\"}" \
+            -backend-config="access_key=${{ steps.vault-secrets.outputs.b2-state-application-key-id }}" \
+            -backend-config="secret_key=${{ steps.vault-secrets.outputs.b2-state-application-key }}" \
+            -input=false
+
+      - name: Terraform validate
+        id: terraform-validate
+        run: terraform validate
+
+      - name: Terraform plan
+        id: terraform-plan
+        run: terraform plan -input=false -out=tfplan
+
+      - name: Terraform apply
+        id: terraform-apply
+        run: terraform apply -input=false tfplan
